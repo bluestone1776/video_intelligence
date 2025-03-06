@@ -1,0 +1,109 @@
+import 'dart:convert';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:googleapis_auth/auth_io.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:mime/mime.dart';
+import 'dart:io';
+
+class VideoAnalyzer {
+  // Get API key and service account credentials path from environment variables.
+  static String get _apiKey => dotenv.env['VIDEO_API_KEY'] ?? '';
+  static String get _serviceAccountPath =>
+      dotenv.env['SERVICE_ACCOUNT_CREDENTIALS_PATH'] ?? '';
+  static String get _apiUrl =>
+      'https://videointelligence.googleapis.com/v1/videos:annotate?key=$_apiKey';
+
+  // Create an authorized client using service account credentials.
+  static Future<AutoRefreshingAuthClient> _getAuthClient() async {
+    final jsonString = await rootBundle.loadString(_serviceAccountPath);
+    final accountCredentials =
+        ServiceAccountCredentials.fromJson(jsonDecode(jsonString));
+    final scopes = ['https://www.googleapis.com/auth/cloud-platform'];
+    return await clientViaServiceAccount(accountCredentials, scopes);
+  }
+
+  // Upload a video file to Google Cloud Storage (GCS) and return its URI.
+  static Future<String> uploadVideoToGCS(File videoFile, String bucketName) async {
+    final client = await _getAuthClient();
+    final mimeType = lookupMimeType(videoFile.path) ?? 'application/octet-stream';
+    final fileName = videoFile.uri.pathSegments.last;
+    final url =
+        'https://storage.googleapis.com/upload/storage/v1/b/$bucketName/o?uploadType=media&name=$fileName';
+
+    final response = await client.post(
+      Uri.parse(url),
+      headers: {'Content-Type': mimeType},
+      body: await videoFile.readAsBytes(),
+    );
+
+    if (response.statusCode == 200) {
+      return 'gs://$bucketName/$fileName';
+    } else {
+      throw Exception('Failed to upload video to GCS: ${response.body}');
+    }
+  }
+
+  // Start video annotation using the Video Intelligence API.
+  static Future<String> startVideoAnnotation(String gcsUri) async {
+    final client = await _getAuthClient();
+    final response = await client.post(
+      Uri.parse(_apiUrl),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'inputUri': gcsUri,
+        'features': ['EXPLICIT_CONTENT_DETECTION'],
+      }),
+    );
+
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      return data['name']; // Operation ID.
+    } else {
+      throw Exception('Error starting video annotation: ${response.body}');
+    }
+  }
+
+  // Poll the annotation operation until it is complete.
+  static Future<Map<String, dynamic>> pollOperation(String operationId) async {
+    final client = await _getAuthClient();
+    final url = 'https://videointelligence.googleapis.com/v1/$operationId?key=$_apiKey';
+
+    while (true) {
+      final response = await client.get(Uri.parse(url));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['done'] == true) {
+          return data;
+        } else {
+          await Future.delayed(const Duration(seconds: 10));
+        }
+      } else {
+        throw Exception('Error polling operation: ${response.body}');
+      }
+    }
+  }
+
+  // Analyze the annotation result to determine if the video is appropriate.
+  static bool isVideoAppropriate(Map<String, dynamic> operationResult) {
+    final annotationResults = operationResult['response']['annotationResults'][0];
+    final explicitAnnotation = annotationResults['explicitAnnotation'];
+    final frames = explicitAnnotation['frames'];
+
+    for (var frame in frames) {
+      final likelihood = frame['pornographyLikelihood'];
+      if (likelihood == 'LIKELY' || likelihood == 'VERY_LIKELY') {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Main function to analyze a video: uploads it, annotates it, and checks for explicit content.
+  static Future<bool> analyzeVideo(File videoFile, String bucketName) async {
+    final gcsUri = await uploadVideoToGCS(videoFile, bucketName);
+    final operationId = await startVideoAnnotation(gcsUri);
+    final operationResult = await pollOperation(operationId);
+    return isVideoAppropriate(operationResult);
+  }
+}
